@@ -1,0 +1,124 @@
+#!/bin/bash -ex
+#
+## AWS EBS Jockey
+#
+
+test_instance_type=m1.medium
+test_availability_zone=us-east-1c
+
+if [ -z "$AWS_ACCESS_KEY" ]; then
+  echo "you MUST set the environment variable AWS_ACCESS_KEY to your key ID."
+  exit 1
+fi
+if [ -z "$AWS_SECRET_KEY" ]; then
+  echo "you MUST set the environment variable AWS_SECRET_KEY to your secret key."
+  exit 1
+fi
+if [ -z "$DEST_DIR" ]; then
+  echo "you MUST set the environment variable DEST_DIR to the location of the image's filesystem."
+  exit 1
+fi
+
+instance_id=`curl -s 169.254.169.254/2012-01-12/meta-data/instance-id`
+if [ "$?" != "0" ]; then
+  echo could not find instance id in the metadata. aborting.
+  exit $?
+fi
+
+if [ ! -f /mnt/ebs/ebs_volume_used.txt ]; then
+  volume_result=`ec2-create-volume --size 7 --availability-zone $test_availability_zone`
+  if [ "$?" != "0" ]; then
+    echo volume creation failed! aborting.
+    exit $?
+  fi
+  volume_id=`echo $volume_result|cut -d' ' -f2`
+  echo $volume_id > /mnt/ebs/ebs_volume_used.txt
+  reusing_volume=false
+else
+  volume_id=`cat /mnt/ebs/ebs_volume_used.txt`
+  reusing_volume=true
+fi
+
+if [ ! -f /mnt/ebs/ebs_top_volume.txt ]; then
+  echo $volume_id > /mnt/ebs/ebs_top_volume.txt
+fi
+
+if [ -n "$SKIP_SYNC" ]; then
+  echo "skipping the syncing of the volume and just pumping an image."
+else
+  ec2-attach-volume $volume_id -i $instance_id -d /dev/sdw
+  while ! file /dev/xvdw; do
+    echo "waiting for EBS attachment"
+    sleep 5
+  done
+
+  if [ "$reusing_volume" = "false" ]; then
+# TODO: zero out the volume.
+    dd if=/dev/zero of=/dev/xvdw bs=4096 ||true
+    mkfs.ext4 /dev/xvdw
+  fi
+
+  mkdir -p /ami_root
+  mount /dev/xvdw /ami_root
+
+  rsync -av --delete $DEST_DIR/ /ami_root/
+
+# unmount and detach the volume
+  umount /dev/xvdw
+  ec2-detach-volume $volume_id
+fi
+
+# create the snap
+snap_result=`ec2-create-snapshot $volume_id --description 'ArchTry - ec2strap'`
+snap_id=`echo $snap_result |cut -d' ' -f2`
+
+# wait for snapshot to complete
+while [ "$snap_status" != "completed" ]; do
+  snap_result=`ec2-describe-snapshots $snap_id`
+  snap_status=`echo $snap_result|cut -d ' ' -f 4`
+  sleep 10
+done
+
+datetimestring=`date +%k%M-%F`
+# Register the image
+# This is us-east only
+reg_result=`ec2-register --snapshot $snap_id \
+             --kernel aki-88aa75e1 \
+             --description "Archlinux 2012" \
+             --name "archlinux64-ebs-pv-$datetimestring" \
+             --block-device-mapping '/dev/sdb=ephemeral0' \
+             --architecture x86_64 \
+             --root-device-name /dev/sda1`
+
+if [ "$?" != "0" ]; then
+  echo failed to register image.  aborting.
+  exit 1
+fi
+ami_id=`echo $reg_result|cut -d' ' -f2`
+
+echo SUCCESS your ami has been created:  $ami_id
+sleep 5
+
+today=`date --iso-8601`
+
+spot_result=`ec2-describe-spot-price-history -a $test_availability_zone -t $test_instance_type -s "${today}T00:00:00+0000" -e "${today}T01:00:00+0000" -d "Linux/UNIX"`
+spot_price=`echo $spot_result|cut -d' ' -f 2`
+
+echo launching a spot instance with this new AMI.
+spot_result=`ec2-request-spot-instances $ami_id -k jeremy_default -n 1 -p $spot_price -r "one-time" -z $test_availability_zone --group default -t $test_instance_type`
+if [ "$?" != "0" ]; then
+  echo failed launch spot instance.  aborting.
+  exit 1
+fi
+spot_id=`echo $spot_result|cut -d' ' -f 2`
+
+while [ "$spot_status" != "active" ]; do
+  echo waiting for spot instance to be active.. instance is $spot_status
+  launch_result=`ec2-describe-spot-instance-requests $spot_id`
+  spot_status=`echo $launch_result|cut -d ' ' -f6`
+  sleep 10
+done
+
+instance_id=`echo $launch_result|cut -d ' ' -f8`
+
+echo SUCCESS! instance: $instance_id is now $spot_status
